@@ -1,0 +1,29 @@
+# ---------- 隐私与密钥：切勿提交 ----------
+# 解密密钥（含微信数据库密钥，极度敏感）
+all_keys.json
+
+# 解密后的明文数据库（含真实聊天记录）
+decrypted/
+decrypted/**
+
+# 检索导出产物（含聊天内容摘录）
+out/
+out_*/
+out_*/
+out_direction/
+out_hr/
+
+# 第三方密钥提取工具（运行时从上游 clone，不随本仓库分发）
+wcdb-key-tool/
+
+# ---------- Python 缓存 ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---------- 系统/编辑器 ----------
+.DS_Store
+Thumbs.db
+*.swp
