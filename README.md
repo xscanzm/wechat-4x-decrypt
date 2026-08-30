@@ -1,3 +1,5 @@
+
+
 # 微信 4.x 本地聊天记录解密与检索 Skill
 
 > **skill 出品 · 周一 · 皮皮未来**
@@ -179,7 +181,7 @@ python scripts/query_messages.py --decrypted-dir decrypted \
 | 会话列表与末条预览 | `session.db` 的 `SessionTable`（`summary` = 末条预览） |
 | 原始消息表 | `message_*.db` 的 `Msg_<md5(username)>`，正文是 protobuf blob |
 
-**三个已踩过的坑**（写查询时务必注意）：
+**四个已踩过的坑**（写查询时务必注意）：
 
 1. **正文表是分片的**：`message_fts_v4_0` ~ `_3` 四张，实测共 24 万行而第一张仅 3.8 万行。只读第一张会漏掉 ~84% 消息，表现为"某个明明很活跃的群一条都搜不到"。必须全部遍历合并，并跳过 FTS5 影子表（`_data`/`_idx`/`_docsize`/`_config`/`_content`）。
 2. **ID 映射只认 `message_fts.db` 的 `name2id`**：不要用 `message_resource.db` 的 `ChatName2Id` / `SenderName2Id`，那两张表只覆盖部分会话，高位 ID 会解析成 `?sid1234`。
