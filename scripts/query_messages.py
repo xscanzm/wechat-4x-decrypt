@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
-"""query_messages.py -- 在解密后的微信 4.x 数据库中检索并导出消息。
+"""query_messages.py -- Search and export messages from decrypted WeChat 4.x databases.
 
-无第三方依赖，仅标准库（sqlite3）。所有表名/列名自动探测，不写死版本细节。
-
-用法:
-    # 1) 先看有哪些会话（不给关键词时列出活跃会话）
-    python query_messages.py --decrypted-dir decrypted --list --since 2026-07-29
-
-    # 2) 按关键词 + 时间窗检索并导出
-    python query_messages.py --decrypted-dir decrypted \
-        --keywords "AI,招聘,HR,面试" --since 2026-07-29 --until 2026-08-12 \
-        --out-dir out
-
-    # 3) 导出指定会话的全部消息（不过滤关键词）
-    python query_messages.py --decrypted-dir decrypted \
-        --session "53618658790@chatroom" --since 2026-07-29 --out-dir out
-
-产出:
-    <out-dir>/digest.txt    按会话分组、时间排序的可读摘录（含发言人与时间戳）
-    <out-dir>/matches.json  全量结构化结果，供复查与二次处理
+Features:
+  - Automatically resolves user input alias, remark, or nickname to internal username
+  - Scans and merges all FTS shards (message_fts_v4_0 ~ _3)
+  - Resolves session and sender identities via name2id table
+  - Supports keyword filtering and date range filtering
+  - Full export by default (no silent truncation, max-per-session=0)
+  - Exports human-readable digest (digest.txt), structured JSON (matches.json), and CSV (chat.csv)
 """
 import argparse
+import csv
 import datetime as dt
 import glob
 import json
@@ -30,9 +20,8 @@ import sys
 from collections import defaultdict
 
 
-# ---------------------------------------------------------------- 工具函数
-
 def ts_to_str(ts):
+    """Convert Unix timestamp to formatted datetime string."""
     try:
         return dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
     except Exception:
@@ -40,6 +29,7 @@ def ts_to_str(ts):
 
 
 def date_to_ts(s, end_of_day=False):
+    """Convert YYYY-MM-DD date string to Unix timestamp."""
     if not s:
         return None
     d = dt.datetime.strptime(s, "%Y-%m-%d")
@@ -49,13 +39,14 @@ def date_to_ts(s, end_of_day=False):
 
 
 def open_ro(path):
-    """只读打开，避免误改原库。"""
+    """Open SQLite database in read-only mode to prevent unintended modifications."""
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     con.text_factory = lambda b: b.decode("utf-8", "replace")
     return con
 
 
 def table_cols(con, table):
+    """Retrieve column names for a given table."""
     try:
         return [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
     except sqlite3.Error:
@@ -63,6 +54,7 @@ def table_cols(con, table):
 
 
 def all_tables(con):
+    """Retrieve all table and view names from the database."""
     try:
         return [r[0] for r in con.execute(
             "SELECT name FROM sqlite_master WHERE type IN ('table','view')")]
@@ -71,7 +63,7 @@ def all_tables(con):
 
 
 def pick(cols, *candidates):
-    """在 cols 中按优先级挑一个存在的列名。"""
+    """Pick the first matching column name from candidates, case-insensitively."""
     low = {c.lower(): c for c in cols}
     for cand in candidates:
         if cand.lower() in low:
@@ -79,10 +71,8 @@ def pick(cols, *candidates):
     return None
 
 
-# ---------------------------------------------------------------- 结构探测
-
 def find_fts_dbs(root):
-    """找出全文索引库（消息正文最省事的来源）。"""
+    """Locate all full-text search databases."""
     hits = []
     for p in glob.glob(os.path.join(root, "**", "*.db"), recursive=True):
         base = os.path.basename(p).lower()
@@ -92,13 +82,10 @@ def find_fts_dbs(root):
 
 
 def find_content_tables(con):
-    """探测所有存放消息正文的表: 需同时具备 正文列 + 会话id + 时间。
+    """Detect message content tables with content, session, and timestamp columns.
 
-    关键: 消息 FTS 是**分片**的（如 message_fts_v4_0 ~ _3），必须全部扫描并合并。
-    只取第一张会漏掉绝大部分消息（实测 4 张分片共 24 万行，第一张仅 3.8 万行）。
-    同时跳过 FTS5 影子表（_data/_idx/_docsize/_config/_content）与空表。
-
-    返回 [(table, col_content, col_session, col_sender, col_time), ...]
+    FTS message tables are sharded (e.g. message_fts_v4_0 ~ _3), which must all be scanned.
+    FTS5 shadow tables (_data, _idx, _docsize, _config, _content) and empty tables are skipped.
     """
     shadow_suffix = ("_data", "_idx", "_docsize", "_config", "_content")
     out = []
@@ -124,11 +111,7 @@ def find_content_tables(con):
 
 
 def load_name2id(con):
-    """FTS 的 session_id / sender_id 都是 name2id 表的 rowid。
-
-    这是关键点: 不要用 message_resource.db 的 ChatName2Id/SenderName2Id，
-    那两张表只覆盖部分会话，高位 id 会解析不出来。
-    """
+    """Parse name2id mapping from message_fts database."""
     for t in all_tables(con):
         if "name2id" not in t.lower():
             continue
@@ -145,16 +128,16 @@ def load_name2id(con):
     return {}
 
 
-def load_display_names(root):
-    """收集 username -> 显示名（群名/好友名）。缺失则降级为 username。
+def load_contacts_index(root):
+    """Build multidimensional contact index from contact databases.
 
-    正确来源: contact.db 的 contact / stranger 表。
-    优先级 remark（用户自定义备注）> nick_name（原始昵称）> alias。
-
-    注意: **不要**用 session.db 的 summary 列——那是"最后一条消息预览"，
-    拿它当群名会得到一堆聊天内容片段。
+    Returns:
+        user2display: Mapping of username -> display name (remark > nick_name > alias > username).
+        query2username: Mapping of lowercased (username/alias/remark/nick_name) -> internal username.
     """
-    names = {}
+    user2display = {}
+    query2username = {}
+
     for path in glob.glob(os.path.join(root, "**", "contact*.db"), recursive=True):
         try:
             con = open_ro(path)
@@ -168,44 +151,81 @@ def load_display_names(root):
             c_remark = pick(cols, "remark")
             c_nick = pick(cols, "nick_name", "nickname", "display_name")
             c_alias = pick(cols, "alias")
-            picks = [c for c in (c_remark, c_nick, c_alias) if c]
-            if not picks:
-                continue
-            sel = 'SELECT "%s", %s FROM "%s"' % (
-                c_user, ", ".join('"%s"' % c for c in picks), t)
+
+            fields = [c for c in [c_user, c_remark, c_nick, c_alias] if c]
+            sel = 'SELECT %s FROM "%s"' % (", ".join('"%s"' % c for c in fields), t)
             try:
                 for row in con.execute(sel):
-                    user, vals = row[0], row[1:]
-                    if not user or user in names:
+                    user = row[0]
+                    if not user:
                         continue
-                    for v in vals:
-                        if v and str(v).strip():
-                            names[user] = str(v).strip()
-                            break
+                    remark = row[1] if len(row) > 1 and row[1] else ""
+                    nick = row[2] if len(row) > 2 and row[2] else ""
+                    alias = row[3] if len(row) > 3 and row[3] else ""
+
+                    disp = remark.strip() or nick.strip() or alias.strip() or user
+                    if user not in user2display:
+                        user2display[user] = disp
+
+                    for val in (user, alias, remark, nick):
+                        if val and str(val).strip():
+                            k = str(val).strip().lower()
+                            if k not in query2username:
+                                query2username[k] = user
             except sqlite3.Error:
                 continue
         con.close()
-    return names
+    return user2display, query2username
 
 
-# ---------------------------------------------------------------- 主流程
+def resolve_session(query_str, query2username, display_names):
+    """Resolve user-supplied alias, remark, or nickname to internal username."""
+    if not query_str:
+        return ""
+    q = query_str.strip()
+    low = q.lower()
+
+    if low in query2username:
+        actual_user = query2username[low]
+        disp = display_names.get(actual_user, actual_user)
+        if q != actual_user:
+            print(f"[+] Resolved session target: '{q}' -> internal username: '{actual_user}' ({disp})")
+        return actual_user
+
+    candidates = []
+    for k, u in query2username.items():
+        if low in k or k in low:
+            candidates.append((u, display_names.get(u, u)))
+    if candidates:
+        seen = set()
+        unique = []
+        for u, d in candidates:
+            if u not in seen:
+                seen.add(u)
+                unique.append((u, d))
+        best_u, best_d = unique[0]
+        print(f"[+] Fuzzy matched contact: '{q}' -> '{best_d}' ({best_u})")
+        return best_u
+
+    return q
+
 
 def main():
-    ap = argparse.ArgumentParser(description="检索解密后的微信 4.x 消息")
-    ap.add_argument("--decrypted-dir", required=True, help="解密输出目录")
-    ap.add_argument("--keywords", default="", help="逗号分隔；留空则不按内容过滤")
-    ap.add_argument("--session", default="", help="只看某个会话（username，如 xxx@chatroom）")
-    ap.add_argument("--since", default="", help="起始日期 YYYY-MM-DD")
-    ap.add_argument("--until", default="", help="结束日期 YYYY-MM-DD")
-    ap.add_argument("--list", action="store_true", help="只列出会话排行，不导出正文")
-    ap.add_argument("--top", type=int, default=15, help="导出前 N 个会话")
-    ap.add_argument("--max-per-session", type=int, default=400)
-    ap.add_argument("--out-dir", default="out")
+    ap = argparse.ArgumentParser(description="Search and export decrypted WeChat 4.x messages")
+    ap.add_argument("--decrypted-dir", required=True, help="Directory containing decrypted databases")
+    ap.add_argument("--keywords", default="", help="Comma-separated keywords; empty matches all")
+    ap.add_argument("--session", default="", help="Target session (alias, remark, nickname, or internal username)")
+    ap.add_argument("--since", default="", help="Start date YYYY-MM-DD")
+    ap.add_argument("--until", default="", help="End date YYYY-MM-DD")
+    ap.add_argument("--list", action="store_true", help="List session activity ranking only without exporting content")
+    ap.add_argument("--top", type=int, default=15, help="Number of top sessions to display/export")
+    ap.add_argument("--max-per-session", type=int, default=0, help="Max messages to export per session (default 0: unlimited)")
+    ap.add_argument("--out-dir", default="out", help="Output directory for exported files")
     args = ap.parse_args()
 
     root = args.decrypted_dir
     if not os.path.isdir(root):
-        print(f"[NG] 目录不存在: {root}")
+        print(f"[NG] Directory not found: {root}")
         return 1
 
     kws = [k.strip().lower() for k in args.keywords.split(",") if k.strip()]
@@ -214,12 +234,14 @@ def main():
 
     fts_dbs = find_fts_dbs(root)
     if not fts_dbs:
-        print(f"[NG] 在 {root} 下没找到 *fts*.db。确认解密步骤已成功完成。")
+        print(f"[NG] No *fts*.db found in {root}. Please ensure decryption completed successfully.")
         return 1
-    print(f"[*] 全文索引库 {len(fts_dbs)} 个")
+    print(f"[*] Full-text search databases: {len(fts_dbs)}")
 
-    display = load_display_names(root)
-    print(f"[*] 显示名映射 {len(display)} 条")
+    display_names, query2username = load_contacts_index(root)
+    print(f"[*] Contact index: {len(display_names)} users")
+
+    target_session = resolve_session(args.session, query2username, display_names)
 
     by_session = defaultdict(list)
     total_scanned = 0
@@ -228,7 +250,7 @@ def main():
         try:
             con = open_ro(db)
         except sqlite3.Error as e:
-            print(f"[!] 打开失败 {os.path.basename(db)}: {e}")
+            print(f"[!] Failed to open {os.path.basename(db)}: {e}")
             continue
 
         tables = find_content_tables(con)
@@ -236,8 +258,6 @@ def main():
             con.close()
             continue
         id2name = load_name2id(con)
-        print(f"    {os.path.basename(db)}: 正文分片 {len(tables)} 张, "
-              f"name2id {len(id2name)} 条")
 
         for tbl, c_content, c_sess, c_send, c_time in tables:
             send_expr = '"%s"' % c_send if c_send else "NULL"
@@ -256,7 +276,7 @@ def main():
             try:
                 rows = con.execute(sql, params).fetchall()
             except sqlite3.Error as e:
-                print(f"[!] 查询失败 {os.path.basename(db)}.{tbl}: {e}")
+                print(f"[!] Query failed {os.path.basename(db)}.{tbl}: {e}")
                 continue
 
             for sid, send_id, ts, content in rows:
@@ -264,7 +284,7 @@ def main():
                 if not content:
                     continue
                 sess_user = id2name.get(int(sid), f"?sid{sid}") if sid is not None else "?"
-                if args.session and sess_user != args.session:
+                if target_session and sess_user != target_session:
                     continue
                 if kws:
                     low = str(content).lower()
@@ -276,54 +296,80 @@ def main():
                 })
         con.close()
 
-    print(f"[*] 扫描 {total_scanned} 条，命中 {sum(len(v) for v in by_session.values())} 条，"
-          f"涉及 {len(by_session)} 个会话")
+    total_hits = sum(len(v) for v in by_session.values())
+    print(f"[*] Scanned records: {total_scanned}, matched messages: {total_hits}, sessions involved: {len(by_session)}")
 
     ranked = sorted(by_session.items(), key=lambda kv: len(kv[1]), reverse=True)
 
-    print("\n会话排行:")
+    print("\nSession ranking:")
     for user, msgs in ranked[:args.top]:
-        label = display.get(user, user)
-        kind = "群" if user.endswith("@chatroom") else "私聊"
-        print(f"  {len(msgs):>5} 条  [{kind}] {label}")
+        label = display_names.get(user, user)
+        kind = "Group" if user.endswith("@chatroom") else "Direct"
+        print(f"  {len(msgs):>5} msgs  [{kind}] {label}")
         if label != user:
-            print(f"            {user}")
+            print(f"            Internal ID: {user}")
 
     if args.list:
+        return 0
+
+    if not ranked:
+        print("[!] No matching messages found.")
         return 0
 
     os.makedirs(args.out_dir, exist_ok=True)
     digest_path = os.path.join(args.out_dir, "digest.txt")
     json_path = os.path.join(args.out_dir, "matches.json")
+    csv_path = os.path.join(args.out_dir, "chat.csv")
 
     payload = []
-    with open(digest_path, "w", encoding="utf-8") as f:
+    csv_rows = []
+
+    with open(digest_path, "w", encoding="utf-8") as f_txt:
         for user, msgs in ranked[:args.top]:
-            label = display.get(user, user)
+            label = display_names.get(user, user)
             msgs.sort(key=lambda m: m["time"])
-            f.write("=" * 72 + "\n")
-            f.write(f"会话: {label}  ({user})  命中 {len(msgs)} 条\n")
-            f.write("=" * 72 + "\n")
-            for m in msgs[:args.max_per_session]:
-                sender = display.get(m["sender"], m["sender"]) or "?"
+
+            export_msgs = msgs if args.max_per_session <= 0 else msgs[:args.max_per_session]
+
+            f_txt.write("=" * 72 + "\n")
+            f_txt.write(f"Session: {label}  ({user})  Matched {len(msgs)} messages, Exported {len(export_msgs)}\n")
+            f_txt.write("=" * 72 + "\n")
+
+            session_payload = {
+                "session": user, "display": label, "total_count": len(msgs),
+                "exported_count": len(export_msgs), "messages": []
+            }
+
+            for m in export_msgs:
+                sender_name = display_names.get(m["sender"], m["sender"]) or "Me"
                 text = " ".join(m["content"].split())
-                f.write(f"[{ts_to_str(m['time'])}] {sender}: {text}\n")
-            f.write("\n")
-            payload.append({
-                "session": user, "display": label, "count": len(msgs),
-                "messages": [
-                    {"time": ts_to_str(m["time"]), "ts": m["time"],
-                     "sender": display.get(m["sender"], m["sender"]),
-                     "content": m["content"]}
-                    for m in msgs[:args.max_per_session]
-                ],
-            })
+                time_str = ts_to_str(m["time"])
+                f_txt.write(f"[{time_str}] {sender_name}: {text}\n")
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+                session_payload["messages"].append({
+                    "time": time_str,
+                    "ts": m["time"],
+                    "sender": sender_name,
+                    "sender_id": m["sender"],
+                    "content": m["content"]
+                })
 
-    print(f"\n[OK] 摘录 -> {digest_path}")
-    print(f"[OK] 结构化 -> {json_path}")
+                csv_rows.append([time_str, label, user, sender_name, m["content"]])
+
+            f_txt.write("\n")
+            payload.append(session_payload)
+
+    with open(json_path, "w", encoding="utf-8") as f_json:
+        json.dump(payload, f_json, ensure_ascii=False, indent=2)
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f_csv:
+        writer = csv.writer(f_csv)
+        writer.writerow(["Time", "Session", "Session_ID", "Sender", "Content"])
+        writer.writerows(csv_rows)
+
+    print(f"\n[OK] Digest text -> {digest_path}")
+    print(f"[OK] Structured JSON -> {json_path}")
+    print(f"[OK] Structured CSV -> {csv_path}")
     return 0
 
 

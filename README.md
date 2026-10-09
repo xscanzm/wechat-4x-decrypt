@@ -153,7 +153,7 @@ python scripts/query_messages.py --decrypted-dir decrypted \
   --keywords "AI,招聘,HR" --since 2026-07-29 --until 2026-08-12 \
   --top 10 --out-dir out
 
-# 导出单个会话全部消息（不过滤关键词）
+# 导出单个会话全部消息（不过滤关键词；--session 支持微信号、备注名、昵称或原始 username）
 python scripts/query_messages.py --decrypted-dir decrypted \
   --session "53618658790@chatroom" --since 2026-07-29 --out-dir out
 ```
@@ -161,9 +161,10 @@ python scripts/query_messages.py --decrypted-dir decrypted \
 产出：
 
 - `out/digest.txt`：按会话分组、时间排序、含发言人与时间戳的可读摘录；
-- `out/matches.json`：全量结构化结果，供复查与二次处理。
+- `out/matches.json`：全量结构化结果，供复查与二次处理；
+- `out/chat.csv`：UTF-8 BOM 编码的表格文件，可直接用 Excel 双击打开分析。
 
-> 让 AI 做总结时，**以 `digest.txt` 为唯一事实来源**，每个结论都能回溯到发言人与时间戳，不要凭印象补写。
+> 默认 `--max-per-session 0` 为全量无截断导出（可传入正整数限制单会话条数）。让 AI 做总结时，**以 `digest.txt` 为唯一事实来源**，每个结论都能回溯到发言人与时间戳，不要凭印象补写。
 
 ---
 
@@ -179,12 +180,13 @@ python scripts/query_messages.py --decrypted-dir decrypted \
 | 会话列表与末条预览 | `session.db` 的 `SessionTable`（`summary` = 末条预览） |
 | 原始消息表 | `message_*.db` 的 `Msg_<md5(username)>`，正文是 protobuf blob |
 
-**三个已踩过的坑**（写查询时务必注意）：
+**四个已踩过的坑**（写查询时务必注意）：
 
 1. **正文表是分片的**：`message_fts_v4_0` ~ `_3` 四张，实测共 24 万行而第一张仅 3.8 万行。只读第一张会漏掉 ~84% 消息，表现为"某个明明很活跃的群一条都搜不到"。必须全部遍历合并，并跳过 FTS5 影子表（`_data`/`_idx`/`_docsize`/`_config`/`_content`）。
 2. **ID 映射只认 `message_fts.db` 的 `name2id`**：不要用 `message_resource.db` 的 `ChatName2Id` / `SenderName2Id`，那两张表只覆盖部分会话，高位 ID 会解析成 `?sid1234`。
 3. **群名不要取 `SessionTable.summary`**：那是最后一条消息预览，拿来当群名会得到一堆聊天内容片段。
-4. `create_time` 为 Unix 秒。
+4. **联系人微信号与内部 username 不一致**：用户日常使用的微信号通常是 `alias` 或备注名（`remark`），而数据库底层所有会话索引均使用内部 `username`（如 `wxid_xxx` 或个性化短 ID）。`query_messages.py` 已内置双向索引映射，支持直接传入微信号/备注/昵称查询；若自行写 SQL 查询，必须先查 `contact.db` 映射出 `username` 再关联 `name2id`。
+5. `create_time` 为 Unix 秒。
 
 ---
 
@@ -211,6 +213,7 @@ SQLCipher 4 变体，AES-256-CBC + HMAC-SHA512：
 | 活跃群搜不到消息 | 只扫了第一张 FTS 分片 | 见第六节点 1 |
 | 会话名显示为 `?sid1234` | ID 映射表用错 | 见第六节点 2 |
 | 群名是一段聊天内容 | 误用 `summary` 当名字 | 见第六节点 3 |
+| 搜微信号/备注名无结果 | 误用 alias/remark 过滤内部 username | 脚本已支持智能解析；若自行编写需查 contact.db 转换（见第六节点 4） |
 | `ImportError: No module named Crypto` | 误按旧说明装/引用了 pycryptodome | 本流程零第三方依赖，不需要它 |
 | `WinDLL('bcrypt')` 失败 | 非 Windows 环境 | 本 skill 仅支持 Windows |
 | `TypeError: unsupported operand ... |` | Python < 3.10 | 换 3.10+ 解释器 |
@@ -241,12 +244,12 @@ python scripts/query_messages.py --decrypted-dir decrypted --list --since 2026-0
 python scripts/query_messages.py --decrypted-dir decrypted \
     --keywords "AI,招聘,HR,面试" --since 2026-07-29 --until 2026-08-12 --out-dir out
 
-# 导出指定会话全部消息
+# 导出指定会话全部消息（支持微信号、备注名、昵称或原始 username）
 python scripts/query_messages.py --decrypted-dir decrypted \
     --session "53618658790@chatroom" --since 2026-07-29 --out-dir out
 ```
 
-参数：`--decrypted-dir`（必填）、`--keywords`、`--session`、`--since`、`--until`、`--list`、`--top`（默认 15）、`--max-per-session`（默认 400）、`--out-dir`（默认 `out`）。
+参数：`--decrypted-dir`（必填）、`--keywords`、`--session`（支持微信号/备注/昵称/username）、`--since`、`--until`、`--list`、`--top`（默认 15）、`--max-per-session`（默认 0，表示全量导出无截断）、`--out-dir`（默认 `out`）。
 
 ---
 
